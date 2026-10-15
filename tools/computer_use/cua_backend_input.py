@@ -38,7 +38,7 @@ class _InputMixin:
         self._rebind_pending = False  # one attempt — never loop re-binds inside an action
         try:
             result = self.focus_app(app, raise_window=False)
-        except Exception:  # noqa: BLE001 — a re-bind failure degrades to the normal refusal
+        except Exception:  # a re-bind failure degrades to the normal refusal
             logger.debug("silent re-bind to %r failed during %s", app, action, exc_info=True)
             return False
         return bool(result.ok and self._active_pid is not None)

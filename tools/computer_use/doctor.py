@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import os
 import platform as _platform_mod
+import psutil
 import re
 import subprocess
 import sys
 from contextlib import contextmanager, suppress
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Optional
+from collections.abc import Callable, Iterator, Sequence
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.permissions import _child_env as _sanitized_cua_env
@@ -390,35 +392,35 @@ def _apply_stale_unit_guard(report: Report) -> Report:
 # own spawns, but a shell-launched `cua-driver serve` bypasses that — doctor is the recovery surface.
 _OVERLAY_NAME_RE = re.compile(r"Cua\.AgentCursorOverlay")
 
-def _is_linux_x11_env(env: Dict[str, str]) -> bool:
+def _is_linux_x11_env(env: dict[str, str]) -> bool:
     """True when *env* targets a Linux/X11 session — the overlay's only wedge habitat (mirrors the
     ``_cua_no_overlay`` X11 branch in ``cua_backend``: Wayland's compositor owns the surface)."""
     return sys.platform == "linux" and bool(env.get("DISPLAY")) \
         and env.get("XDG_SESSION_TYPE") != "wayland" and not env.get("WAYLAND_DISPLAY")
 
-def _probe_root_tree(env: Dict[str, str]) -> Optional[str]:
+def _probe_root_tree(env: dict[str, str]) -> Optional[str]:
     """``xwininfo -root -tree`` stdout, None when xwininfo is missing or the display is unreachable."""
     try:
-        proc = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=6.0, check=False, env=env,
+        proc = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=6.0, check=False, env=env,
                               stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
     except _IO_EXC:
         return None
     return proc.stdout if proc.returncode == 0 else None
 
-def _parse_overlay_windows(tree_text: str) -> List[int]:
+def _parse_overlay_windows(tree_text: str) -> list[int]:
     """Window ids of cua-driver cursor-overlay windows in an ``xwininfo -root -tree`` dump."""
-    ids: List[int] = []
+    ids: list[int] = []
     for line in tree_text.splitlines():
         if _OVERLAY_NAME_RE.search(line) and (match := re.match(r"\s*(0x[0-9a-fA-F]+)", line)):
             ids.append(int(match.group(1), 16))
     return ids
 
-def _probe_window_pid(window_id: int, env: Dict[str, str]) -> Optional[int]:
+def _probe_window_pid(window_id: int, env: dict[str, str]) -> Optional[int]:
     """``_NET_WM_PID`` of one window, None when the property is absent or xprop fails."""
     try:
-        proc = subprocess.run(["xprop", "-id", hex(window_id), "_NET_WM_PID"], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=4.0, check=False, env=env,
+        proc = subprocess.run(["xprop", "-id", hex(window_id), "_NET_WM_PID"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=4.0, check=False, env=env,
                               stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
     except _IO_EXC:
         return None
@@ -426,22 +428,14 @@ def _probe_window_pid(window_id: int, env: Dict[str, str]) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 def _pid_alive(pid: Optional[int]) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:  # exists, owned by someone else
-        return True
-    except OSError:
-        return False
-    return True
+    # psutil over os.kill(pid, 0): os.kill with signal 0 is NOT a no-op on Windows — it sends
+    # CTRL_C_EVENT to the target's console process group (bpo-14484).
+    return bool(pid) and psutil.pid_exists(pid)
 
-def _xkill_window(window_id: int, env: Dict[str, str]) -> bool:
+def _xkill_window(window_id: int, env: dict[str, str]) -> bool:
     try:
-        proc = subprocess.run(["xkill", "-id", str(window_id)], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=5.0, check=False, env=env,
+        proc = subprocess.run(["xkill", "-id", str(window_id)], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=5.0, check=False, env=env,
                               stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
     except _IO_EXC:
         return False
