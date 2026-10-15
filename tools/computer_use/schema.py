@@ -198,7 +198,11 @@ COMPUTER_USE_SCHEMA: dict[str, Any] = {
         "action='capture' (mode='som' gives numbered element overlays), then click by `element` "
         "index; re-capture after state-changing actions (or pass capture_after=true). Image "
         "captures include a shareable `screenshot_path`; deliver it via the platform's MEDIA "
-        "syntax when the user asks to see it — not for captures used only for control."
+        "syntax when the user asks to see it — not for captures used only for control. "
+        "This envelope wraps cua-driver's core actions; the driver itself ships more primitives "
+        "(zoom for region captures, verify_state, set_window_frame, clipboard_read/clipboard_write, "
+        "set_agent_cursor_enabled, end_session) — in a terminal, list them with "
+        "`cua-driver list-tools` and invoke any of them with `cua-driver call <tool> '<json>'`."
     ),
     "parameters": {"type": "object", "properties": _PROPERTIES, "required": ["action"]},
 }

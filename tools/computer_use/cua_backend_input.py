@@ -3,10 +3,14 @@ value-setter methods (mixed into ``CuaDriverBackend``)."""
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from tools.computer_use.backend import ActionResult
 from tools.computer_use.cua_backend_parse import _parse_key_combo
+
+logger = logging.getLogger("tools.computer_use.cua_backend")
 
 _NO_TARGET_MSG = "No active window — call capture() first."
 _BTF_UNSUPPORTED_MSG = "The connected cua-driver does not advertise the standalone bring_to_front tool."
@@ -24,10 +28,27 @@ def _refuse(action: str, message: str, **fields: Any) -> ActionResult:
 class _InputMixin:
     """Pointer / keyboard / value-setter actions against the sticky target."""
 
+    def _try_silent_rebind(self, action: str) -> bool:
+        """F3/P2: when the active-window watchdog invalidated the sticky target, re-bind once via
+        ``focus_app(last_app, raise_window=False)`` before refusing. True when a target was
+        re-established; a failure disarms the pending flag and lets the caller refuse normally."""
+        app = getattr(self, "_last_app", None)
+        if not getattr(self, "_rebind_pending", False) or not app:
+            return False
+        self._rebind_pending = False  # one attempt — never loop re-binds inside an action
+        try:
+            result = self.focus_app(app, raise_window=False)
+        except Exception:  # noqa: BLE001 — a re-bind failure degrades to the normal refusal
+            logger.debug("silent re-bind to %r failed during %s", app, action, exc_info=True)
+            return False
+        return bool(result.ok and self._active_pid is not None)
+
     def _target_args(self, action: str, *, need_window: bool = False) -> tuple[Optional[ActionResult], dict[str, Any]]:
         """``(refusal, base args)`` for an input action against the sticky target."""
         if self._active_pid is None or (need_window and self._active_window_id is None):
-            return _refuse(action, _NO_TARGET_MSG), {}
+            if not self._try_silent_rebind(action) or self._active_pid is None \
+                    or (need_window and self._active_window_id is None):
+                return _refuse(action, _NO_TARGET_MSG), {}
         return None, {"pid": self._active_pid, **({"window_id": self._active_window_id} if need_window else {})}
 
     def _pointer_args(self, tool: str, args: dict[str, Any], variants: Sequence[_Variant],
@@ -61,6 +82,19 @@ class _InputMixin:
         args["delivery_mode"] = "foreground"
         return None
 
+    def _input_hit_dead_window(self, result: ActionResult) -> bool:
+        """True when the driver PROVED the input never left the station: an X11 error naming our
+        own sticky ``window_id`` as the bad value (focus-translate/routing failed before any event
+        was injected), so re-binding and re-issuing the action cannot replay delivered input.
+        Live F3 shape: ``X11Error { error_kind: Window, error_code: 3, ... bad_value: <id> }``."""
+        if result.ok or self._active_window_id is None:
+            return False
+        blob = f"{result.message or ''} {result.meta or {}}"
+        if "X11Error" not in blob:
+            return False
+        match = re.search(r"bad_value: (\d+)", blob)
+        return match is not None and int(match.group(1)) == self._active_window_id
+
     def _run_input_action(self, action: str, args: dict[str, Any], delivery_mode: Optional[str],
                           bring_to_front: bool) -> ActionResult:
         """Apply one delivery rung, optionally focusing via its own tool. ``bring_to_front`` is never an
@@ -82,6 +116,25 @@ class _InputMixin:
             if not focused.ok:
                 return focused
         result = self._action(action, args)
+        if self._input_hit_dead_window(result):
+            # F3 race (the watchdog polls; a window can die between polls): the driver proved the
+            # event never injected — re-bind to the recreated window and re-issue ONCE.
+            logger.info("input %s hit a destroyed window (%s); silently re-binding and re-issuing",
+                        action, self._active_window_id)
+            app = getattr(self, "_last_app", None)
+            self._invalidate_sticky_target()
+            if self._try_silent_rebind(action):
+                args["pid"] = self._active_pid
+                if "window_id" in args:
+                    args["window_id"] = self._active_window_id
+                result = self._action(action, args)
+            else:
+                # Nothing left to bind to (e.g. the browser's last window closed): replace the raw
+                # X11 error with the actionable next step instead of a wedged-looking crash.
+                return ActionResult(ok=False, action=action, code="target_window_destroyed",
+                                    message=(f"The targeted window was destroyed mid-session and no "
+                                             f"{app + ' ' if app else ''}window remains to re-bind. "
+                                             "Take a fresh capture to establish a new target."))
         if bring_to_front:
             result.meta["foreground_focus"] = {"invoked": True, "tool": "bring_to_front"}
         return result

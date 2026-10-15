@@ -384,6 +384,98 @@ def _apply_stale_unit_guard(report: Report) -> Report:
                 report["overall"] = "degraded"
     return report
 
+# F1 (docs/hermes-cua-improvements.md): after an unclean cua-driver session end the cursor-overlay window
+# (Cua.AgentCursorOverlay.* — fullscreen, all-workspaces, no compositor-owned lifecycle) can stay mapped over
+# every workspace and black out X11 capture until the driver restarts. Hermes defaults the overlay off for its
+# own spawns, but a shell-launched `cua-driver serve` bypasses that — doctor is the recovery surface.
+_OVERLAY_NAME_RE = re.compile(r"Cua\.AgentCursorOverlay")
+
+def _is_linux_x11_env(env: Dict[str, str]) -> bool:
+    """True when *env* targets a Linux/X11 session — the overlay's only wedge habitat (mirrors the
+    ``_cua_no_overlay`` X11 branch in ``cua_backend``: Wayland's compositor owns the surface)."""
+    return sys.platform == "linux" and bool(env.get("DISPLAY")) \
+        and env.get("XDG_SESSION_TYPE") != "wayland" and not env.get("WAYLAND_DISPLAY")
+
+def _probe_root_tree(env: Dict[str, str]) -> Optional[str]:
+    """``xwininfo -root -tree`` stdout, None when xwininfo is missing or the display is unreachable."""
+    try:
+        proc = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=6.0, check=False, env=env,
+                              stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+    except _IO_EXC:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+def _parse_overlay_windows(tree_text: str) -> List[int]:
+    """Window ids of cua-driver cursor-overlay windows in an ``xwininfo -root -tree`` dump."""
+    ids: List[int] = []
+    for line in tree_text.splitlines():
+        if _OVERLAY_NAME_RE.search(line) and (match := re.match(r"\s*(0x[0-9a-fA-F]+)", line)):
+            ids.append(int(match.group(1), 16))
+    return ids
+
+def _probe_window_pid(window_id: int, env: Dict[str, str]) -> Optional[int]:
+    """``_NET_WM_PID`` of one window, None when the property is absent or xprop fails."""
+    try:
+        proc = subprocess.run(["xprop", "-id", hex(window_id), "_NET_WM_PID"], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=4.0, check=False, env=env,
+                              stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+    except _IO_EXC:
+        return None
+    match = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", proc.stdout or "")
+    return int(match.group(1)) if match else None
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    except OSError:
+        return False
+    return True
+
+def _xkill_window(window_id: int, env: Dict[str, str]) -> bool:
+    try:
+        proc = subprocess.run(["xkill", "-id", str(window_id)], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=5.0, check=False, env=env,
+                              stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+    except _IO_EXC:
+        return False
+    return proc.returncode == 0
+
+def _apply_wedged_overlay_guard(report: Report, binary: Optional[str] = None) -> Report:
+    """Detect and clear wedged cua-driver cursor-overlay windows (F1). The real wedge leaves the overlay
+    mapped by the STILL-RUNNING daemon's X connection (an unclean session end corrupts driver state; the
+    window cannot outlive its client), so ``xkill -id`` is applied to every ``Cua.AgentCursorOverlay.*``
+    window found — accepting that the owner's whole X connection drops, which is exactly the F1 remedy
+    ("blocks all X11 capture until cua-driver is restarted"). Run doctor between sessions, not mid-session."""
+    checks = report.get("checks")
+    if sys.platform != "linux" or not isinstance(checks, list):
+        return report
+    env = _sanitized_cua_env()
+    if not _is_linux_x11_env(env) or (tree := _probe_root_tree(env)) is None:
+        return report
+    for window_id in _parse_overlay_windows(tree):
+        pid = _probe_window_pid(window_id, env)
+        killed = _xkill_window(window_id, env)
+        shown = f"0x{window_id:x}"
+        checks.append({"name": "wedged cursor overlay", "status": "pass" if killed else "fail",
+                       "message": (f"cleared stale cua-driver cursor overlay {shown}" + (
+                           f" (owner pid {pid} was still alive — its X connection dropped with the overlay; "
+                           "restart the cua-driver daemon before the next session)" if _pid_alive(pid)
+                           else f" (owner pid {pid or 'unknown'} is gone; it was blacking out X11 capture)")
+                                   if killed
+                                   else f"cua-driver cursor overlay {shown} survives — xkill failed; clear it "
+                                        f"manually: xkill -id {window_id}"),
+                       "data": {"window_id": window_id, "pid": pid, "killed": killed}})
+        if not killed and report.get("overall") == "ok":
+            report["overall"] = "degraded"
+    return report
+
 def _wayland_environment_context(report: Report) -> Optional[Report]:
     """Linux+Wayland only: doctor probes the CLI process's environment, not the gateway's."""
     if report.get("platform") != "linux" or not os.environ.get("WAYLAND_DISPLAY"):
@@ -458,6 +550,7 @@ def run_doctor(driver_cmd: Optional[str] = None, *, include: Sequence[str] = (),
     report = _apply_stale_tcc_guard(report)
     report = _apply_stale_unit_guard(report)
     report = _apply_daemon_liveness_guard(report, binary)
+    report = _apply_wedged_overlay_guard(report, binary)
     identity = _build_identity(binary, report)
     environment = _wayland_environment_context(report)
     if json_output:

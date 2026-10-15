@@ -28,6 +28,7 @@ from tools.computer_use.cua_backend_driver import (
 from tools.computer_use.cua_backend_input import _InputMixin
 from tools.computer_use.cua_backend_parse import _action_result_from
 from tools.computer_use.cua_backend_session import _AsyncBridge, _CuaDriverSession
+from tools.computer_use.cua_backend_watchdog import _ActiveWindowWatchdog
 
 logger = logging.getLogger(__name__)
 # cua-driver's anonymous PostHog telemetry gate ("0" disables; absent => ON upstream).
@@ -266,8 +267,12 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # Sticky target (set by capture()/focus_app(), used by actions): `_active_pid`, `_active_window_id`, `_last_app`,
         # `_last_target` (exact identity for capture_after — Linux app names may be generic, e.g. several unrelated Qt
         # windows all say Qt6Application), `_snapshot_tokens` (element_index -> element_token, attached to actions so
-        # cua-driver reports "stale" instead of silently re-resolving).
+        # cua-driver reports "stale" instead of silently re-resolving), `_rebind_pending` (P2/F3: the active-window
+        # watchdog invalidated the target but kept `_last_app`; the next input action re-binds silently).
         self._clear_active_target()
+        # F3/P2: polls _NET_ACTIVE_WINDOW and invalidates the sticky target when the WM's focus
+        # moves off it (Playwright's juggler-pipe recreates Camoufox windows mid-session).
+        self._watchdog = _ActiveWindowWatchdog(self)
         # Public session label (one per Hermes run) sent as `session` on every call: owns the cursor color and
         # gives config/recording state a stable owner across transport restarts. Part of the 0.20 runtime contract.
         self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
@@ -326,8 +331,11 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
             if _cua_no_overlay():  # belt-and-suspenders when --no-overlay is unsupported or ignored
                 self._best_effort("set_agent_cursor_enabled failed",
                                   self.set_agent_cursor_enabled, False, cursor_id=self._session_id)
+        # F3/P2: sticky-target invalidation once the session is live (no-op outside Linux/X11).
+        self._watchdog.start()
 
     def stop(self) -> None:
+        self._watchdog.stop()  # before teardown: no invalidations against a dying session
         # Best-effort end_session so the driver cleans per-session state (cursor overlay, recording ownership,
         # config overrides); the connection drop below releases daemon-side state regardless.
         if self._session._started:
@@ -352,6 +360,7 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
     def _clear_active_target(self) -> None:
         """Forget a capture/focus target so a failed lookup cannot misroute input."""
         self._active_pid = self._active_window_id = self._last_app = self._last_target = None
+        self._rebind_pending = False
         # Surface 6 of NousResearch/hermes-agent#47072: per-snapshot `element_index -> element_token` map
         # populated on capture(). Action tools (click/scroll/set_value/...) attach the matching token
         # alongside `element_index` so cua-driver detects "stale" explicitly instead of silently
@@ -359,10 +368,20 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # context.
         self._snapshot_tokens: dict[int, str] = {}
 
+    def _invalidate_sticky_target(self) -> None:
+        """Watchdog entry point (F3/P2): the WM's active window moved off the sticky target —
+        forget the exact ids but KEEP ``_last_app`` and arm the silent re-bind, so the next input
+        action re-resolves via ``focus_app(app, raise_window=False)`` instead of crashing with
+        ``X11Error code 3`` on a window Playwright already destroyed."""
+        self._active_pid = self._active_window_id = self._last_target = None
+        self._snapshot_tokens = {}
+        self._rebind_pending = True
+
     def _set_active_target(self, target: dict[str, Any]) -> None:
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
         self._snapshot_tokens = {}  # prior snapshot's tokens: disarm before any capture so an exception can't pair them
+        self._rebind_pending = False
         self._last_target = {"pid": self._active_pid, "window_id": self._active_window_id}
 
     def launch_app(self, *, bundle_id: Optional[str] = None, name: Optional[str] = None,
